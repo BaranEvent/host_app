@@ -1,0 +1,17 @@
+[[pages]]
+path = "pages/event_creation.py"
+name = "Event Creation"
+icon = "🎉"
+hidden = true
+
+[[pages]]
+path = "pages/feature_management.py"
+name = "Feature Management"
+icon = "⚙️"
+hidden = true
+
+[[pages]]
+path = "pages/form_builder.py"
+name = "Form Builder"
+icon = "📝"
+hidden = true 
