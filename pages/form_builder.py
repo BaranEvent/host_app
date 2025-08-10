@@ -21,6 +21,8 @@ if 'show_preview' not in st.session_state:
     st.session_state.show_preview = False
 if 'event_id' not in st.session_state:
     st.session_state.event_id = None
+if 'has_loaded_form' not in st.session_state:
+    st.session_state.has_loaded_form = False  # load guard
 
 # Airtable configuration
 AIRTABLE_CONFIG = {
@@ -31,7 +33,7 @@ AIRTABLE_CONFIG = {
 # Data type options in Turkish
 DATA_TYPES = {
     "Yazı": "text",
-    "Sayı": "number", 
+    "Sayı": "number",
     "Virgüllü sayı": "float",
     "Tarih": "date",
     "Saat ve tarih": "datetime",
@@ -39,26 +41,24 @@ DATA_TYPES = {
     "Çoktan seçmeli": "single_choice",
     "Çoktan seçmeli çoklu cevap": "multiple_choice"
 }
+# Reverse map for loading existing rows
+DATA_TYPES_REVERSE = {v: k for k, v in DATA_TYPES.items()}
 
 def get_airtable_api():
-    """Get Airtable API instance"""
     return Api(AIRTABLE_CONFIG["api_key"])
 
 def get_airtable_table(table_name="registration_form"):
-    """Get Airtable table instance"""
     api = get_airtable_api()
     return api.table(AIRTABLE_CONFIG["base_id"], table_name)
 
 def get_event_features_table():
-    """Get event_features table instance"""
     api = get_airtable_api()
     return api.table(AIRTABLE_CONFIG["base_id"], "event_features")
 
 def add_question():
-    """Add a new question to the form"""
-    question_id = f"question_{st.session_state.question_counter}"
+    qid = f"question_{st.session_state.question_counter}"
     st.session_state.questions.append({
-        'id': question_id,
+        'id': qid,
         'question': '',
         'type': 'Yazı',
         'is_required': False,
@@ -68,119 +68,155 @@ def add_question():
     st.session_state.question_counter += 1
 
 def remove_question(question_id):
-    """Remove a question from the form"""
     st.session_state.questions = [q for q in st.session_state.questions if q['id'] != question_id]
-    # Reorder ranks
-    for i, question in enumerate(st.session_state.questions):
-        question['rank'] = i
+    for i, q in enumerate(st.session_state.questions):
+        q['rank'] = i
 
 def move_question_up(index):
-    """Move a question up in the list"""
     if index > 0:
         st.session_state.questions[index], st.session_state.questions[index-1] = \
             st.session_state.questions[index-1], st.session_state.questions[index]
-        # Update ranks
-        for i, question in enumerate(st.session_state.questions):
-            question['rank'] = i
+        for i, q in enumerate(st.session_state.questions):
+            q['rank'] = i
 
 def move_question_down(index):
-    """Move a question down in the list"""
     if index < len(st.session_state.questions) - 1:
         st.session_state.questions[index], st.session_state.questions[index+1] = \
             st.session_state.questions[index+1], st.session_state.questions[index]
-        # Update ranks
-        for i, question in enumerate(st.session_state.questions):
-            question['rank'] = i
+        for i, q in enumerate(st.session_state.questions):
+            q['rank'] = i
 
 def add_option(question_id):
-    """Add an option to a multiple choice question"""
-    for question in st.session_state.questions:
-        if question['id'] == question_id:
-            question['options'].append('')
+    for q in st.session_state.questions:
+        if q['id'] == question_id:
+            q['options'].append('')
             break
 
 def remove_option(question_id, option_index):
-    """Remove an option from a multiple choice question"""
-    for question in st.session_state.questions:
-        if question['id'] == question_id:
-            question['options'].pop(option_index)
+    for q in st.session_state.questions:
+        if q['id'] == question_id:
+            q['options'].pop(option_index)
             break
 
+# -------- LOAD EXISTING FORM (ordered by rank asc) ----------
+def load_existing_form(event_id):
+    """Always attempt to load once per page entry; populates builder if rows exist."""
+    if st.session_state.has_loaded_form:
+        return
+    try:
+        table = get_airtable_table()
+        event_id_int = int(event_id)
+        existing = table.all(formula=f"{{event_id}} = {event_id_int}")
+        if not existing:
+            st.session_state.has_loaded_form = True
+            return
+
+        # sort by 'rank' (default 0 if missing)
+        existing_sorted = sorted(existing, key=lambda r: r['fields'].get('rank', 0))
+
+        st.session_state.questions = []
+        st.session_state.question_counter = 0
+
+        for rec in existing_sorted:
+            f = rec.get('fields', {})
+            qid = f"question_{st.session_state.question_counter}"
+
+            # type mapping
+            saved_type_code = f.get('type', 'text')
+            saved_type_label = DATA_TYPES_REVERSE.get(saved_type_code, 'Yazı')
+
+            # possible answers
+            options_raw = f.get('possible_answers')
+            if isinstance(options_raw, list):
+                options_list = options_raw
+            elif isinstance(options_raw, str):
+                try:
+                    parsed = json.loads(options_raw)
+                    options_list = parsed if isinstance(parsed, list) else []
+                except Exception:
+                    options_list = []
+            else:
+                options_list = []
+
+            st.session_state.questions.append({
+                'id': qid,
+                'question': f.get('name', ''),
+                'type': saved_type_label,
+                'is_required': bool(f.get('is_required', False)),
+                'options': options_list,
+                'rank': int(f.get('rank', len(st.session_state.questions)))
+            })
+            st.session_state.question_counter += 1
+
+        st.session_state.has_loaded_form = True
+        st.info("Mevcut kayıt formu yüklendi. Düzenleyebilirsiniz.")
+    except Exception as e:
+        st.warning(f"Mevcut form yüklenemedi: {str(e)}")
+        st.session_state.has_loaded_form = True  # avoid loops
+
+# -------- SAVE: DELETE ALL THEN CREATE FRESH ----------
 def save_form():
-    """Save the form to Airtable"""
     if not st.session_state.questions:
         st.error("Lütfen en az bir soru ekleyin!")
         return
-    
-    # Use event_id from session state or default to "0"
-    event_id = st.session_state.event_id or "0"
-    
+
+    raw_event_id = st.session_state.event_id if st.session_state.event_id is not None else 0
+    try:
+        event_id_int = int(raw_event_id)
+    except Exception:
+        st.error("Geçersiz Event ID.")
+        return
+
     try:
         table = get_airtable_table()
-        
-        for question in st.session_state.questions:
-            # Prepare the record data
-            record_data = {
-                "event_id": event_id,
-                "name": question['question'],
-                "type": DATA_TYPES[question['type']],
-                "is_required": question['is_required'],
-                "rank": question['rank']
-            }
-            
-            # Add possible_answers for multiple choice questions
-            if question['type'] in ['Çoktan seçmeli', 'Çoktan seçmeli çoklu cevap']:
-                record_data["possible_answers"] = json.dumps(question['options'])
-            
-            # Create record in Airtable
-            table.create(record_data)
-        
-        st.success(f"Form başarıyla kaydedildi! Event ID: {event_id}")
-        
-        # Update event_features table
+
+        # 1) delete all existing rows for this event_id
         try:
-            event_features_table = get_event_features_table()
-            
-            # Convert event_id to integer for comparison
-            # Handle both string and integer event_id
-            if isinstance(event_id, str):
-                event_id_int = int(event_id) if event_id.isdigit() else 0
-            else:
-                event_id_int = int(event_id) if event_id else 0
-                
-            st.info(f"Looking for event_id: {event_id_int}, feature_id: 1")
-            
-            # Look for existing record with same event_id and feature_id = 1
-            records = event_features_table.all(formula=f"AND({{event_id}} = {event_id_int}, {{feature_id}} = 1)")
-            st.info(f"Found {len(records)} existing records")
-            
+            to_delete = table.all(formula=f"{{event_id}} = {event_id_int}")
+            ids = [r['id'] for r in to_delete]
+            if ids:
+                # batch_delete if available, else fallback to loop
+                try:
+                    table.batch_delete(ids)
+                except Exception:
+                    for rid in ids:
+                        table.delete(rid)
+        except Exception as e_del:
+            st.warning(f"Eski form silinirken uyarı: {str(e_del)}")
+
+        # 2) create fresh rows from the builder (respect rank)
+        questions_sorted = sorted(st.session_state.questions, key=lambda q: q['rank'])
+        for q in questions_sorted:
+            record_data = {
+                "event_id": event_id_int,
+                "name": q['question'],
+                "type": DATA_TYPES[q['type']],
+                "is_required": q['is_required'],
+                "rank": q['rank']
+            }
+            if q['type'] in ['Çoktan seçmeli', 'Çoktan seçmeli çoklu cevap']:
+                record_data["possible_answers"] = json.dumps(q['options'])
+
+            try:
+                table.create(record_data)
+            except Exception as e_new:
+                st.error(f"Oluşturma hatası (soru: {q['question']}): {str(e_new)}")
+
+        st.success(f"Form başarıyla kaydedildi! Event ID: {event_id_int}")
+
+        # Keep event_features toggled ON for this event
+        try:
+            ef_table = get_event_features_table()
+            records = ef_table.all(formula=f"AND({{event_id}} = {event_id_int}, {{feature_id}} = 1)")
             if records:
-                # Update existing record
-                record_id = records[0]['id']
-                event_features_table.update(record_id, {"is_active": True})
-                st.info("Event features table updated successfully!")
+                ef_table.update(records[0]['id'], {"is_active": True})
             else:
-                # Create new record
-                event_features_table.create({
-                    "event_id": event_id_int,
-                    "feature_id": 1,
-                    "is_active": True
-                })
-                st.info("New event features record created successfully!")
-                
+                ef_table.create({"event_id": event_id_int, "feature_id": 1, "is_active": True})
         except Exception as e:
-            st.warning(f"Event features table update failed: {str(e)}")
-            st.error(f"Error details: {str(e)}")
-        
-        # Clear the form and reset counters
-        st.session_state.questions = []
-        st.session_state.question_counter = 0
+            st.warning(f"Event features güncelleme uyarısı: {str(e)}")
+
         st.session_state.show_preview = False
-        
-        # Show success message and navigation options
-        st.success("✅ Form başarıyla kaydedildi!")
-        st.info("Form Builder'ı temizledik. Yeni sorular ekleyebilir veya ana sayfaya dönebilirsiniz.")
-        
+        st.info("Değişiklikleriniz kaydedildi.")
         col1, col2, col3 = st.columns(3)
         with col1:
             if st.button("🏠 Ana Sayfaya Dön", type="primary", use_container_width=True, key="nav_to_home_form"):
@@ -189,16 +225,15 @@ def save_form():
             if st.button("⚙️ Özellik Yönetimi", type="secondary", use_container_width=True, key="nav_to_features_form"):
                 st.switch_page("pages/feature_management.py")
         with col3:
-            if st.button("📝 Yeni Form Oluştur", type="secondary", use_container_width=True, key="new_form"):
+            if st.button("🔄 Formu Yeniden Yükle", type="secondary", use_container_width=True, key="reload_form"):
+                st.session_state.has_loaded_form = False
                 st.rerun()
-        
+
     except Exception as e:
         st.error(f"Form kaydedilirken hata oluştu: {str(e)}")
 
 def render_question_preview(question):
-    """Render a preview of how the question will look"""
     st.markdown(f"**{question['question']}**")
-    
     if question['type'] == 'Yazı':
         st.text_input("Cevap", key=f"preview_{question['id']}", disabled=True)
     elif question['type'] == 'Sayı':
@@ -220,143 +255,104 @@ def render_question_preview(question):
         else:
             st.info("Seçenek ekleyin")
 
-# Main app
+# ---------------- MAIN ----------------
 def main():
     st.title("📝 Form Builder Dashboard")
-    st.markdown("Kayıt formu oluşturmak için aşağıdaki araçları kullanın.")
-    
-    # Back to home button
+    st.markdown("Kayıt formu oluşturmak / düzenlemek için aşağıdaki araçları kullanın.")
+
     if st.sidebar.button("🏠 Ana Sayfaya Dön", key="sidebar_home"):
         st.switch_page("app.py")
-    
-    # Get event_id from session state
+
     event_id = st.session_state.get('event_id', None)
     feature_key = st.session_state.get('feature_key', None)
-    
+
     if event_id is None:
         st.error("Event ID bulunamadı. Lütfen ana sayfadan tekrar başlayın.")
         if st.button("🏠 Ana Sayfaya Dön", key="error_home"):
             st.switch_page("app.py")
         return
-    
+
     st.info(f"Event ID: {event_id}")
     if feature_key:
         st.info(f"Özellik: {feature_key}")
-    
-    # Main content area
+
+    # Load existing schema (once per entry)
+    load_existing_form(event_id)
+
     st.header("Form Oluşturucu")
-    
+
     if not st.session_state.questions:
-        st.info("Soru eklemek için aşağıdaki 'Yeni Soru Ekle' butonuna tıklayın.")
-    
-    for i, question in enumerate(st.session_state.questions):
+        st.info("Mevcut form bulunamadı. Yeni bir soru ekleyebilirsiniz.")
+
+    for i, q in enumerate(st.session_state.questions):
         with st.container():
             st.markdown("---")
-            
-            # Question controls - using containers instead of nested columns
-            control_container = st.container()
-            with control_container:
-                col_delete, col_up, col_down = st.columns([2, 1, 1])
-                
-                with col_delete:
-                    if st.button(f"🗑️ Sil", key=f"delete_{question['id']}"):
-                        remove_question(question['id'])
+            ctrl = st.container()
+            with ctrl:
+                c1, c2, c3 = st.columns([2,1,1])
+                with c1:
+                    if st.button("🗑️ Sil", key=f"delete_{q['id']}"):
+                        remove_question(q['id'])
                         st.rerun()
-                
-                with col_up:
-                    if st.button("⬆️", key=f"up_{question['id']}"):
+                with c2:
+                    if st.button("⬆️", key=f"up_{q['id']}"):
                         move_question_up(i)
                         st.rerun()
-                
-                with col_down:
-                    if st.button("⬇️", key=f"down_{question['id']}"):
+                with c3:
+                    if st.button("⬇️", key=f"down_{q['id']}"):
                         move_question_down(i)
                         st.rerun()
-            
-            # Question form
-            question['question'] = st.text_input(
-                "Soru:", 
-                value=question['question'],
-                key=f"question_text_{question['id']}"
-            )
-            
-            # Type and required fields
-            type_container = st.container()
-            with type_container:
-                col_type, col_required = st.columns(2)
-                
-                with col_type:
-                    question['type'] = st.selectbox(
+
+            q['question'] = st.text_input("Soru:", value=q['question'], key=f"question_text_{q['id']}")
+
+            with st.container():
+                ctype, creq = st.columns(2)
+                with ctype:
+                    q['type'] = st.selectbox(
                         "Veri Tipi:",
                         options=list(DATA_TYPES.keys()),
-                        index=list(DATA_TYPES.keys()).index(question['type']),
-                        key=f"type_{question['id']}"
+                        index=list(DATA_TYPES.keys()).index(q['type']),
+                        key=f"type_{q['id']}"
                     )
-                
-                with col_required:
-                    question['is_required'] = st.checkbox(
-                        "Zorunlu alan",
-                        value=question['is_required'],
-                        key=f"required_{question['id']}"
-                    )
-            
-            # Multiple choice options
-            if question['type'] in ['Çoktan seçmeli', 'Çoktan seçmeli çoklu cevap']:
+                with creq:
+                    q['is_required'] = st.checkbox("Zorunlu alan", value=q['is_required'], key=f"required_{q['id']}")
+
+            if q['type'] in ['Çoktan seçmeli', 'Çoktan seçmeli çoklu cevap']:
                 st.markdown("**Seçenekler:**")
-                
-                for j, option in enumerate(question['options']):
-                    option_container = st.container()
-                    with option_container:
-                        col_option, col_remove = st.columns([4, 1])
-                        with col_option:
-                            question['options'][j] = st.text_input(
-                                f"Seçenek {j+1}:",
-                                value=option,
-                                key=f"option_{question['id']}_{j}"
-                            )
-                        with col_remove:
-                            if st.button("❌", key=f"remove_option_{question['id']}_{j}"):
-                                remove_option(question['id'], j)
+                for j, opt in enumerate(q['options']):
+                    with st.container():
+                        co, cr = st.columns([4,1])
+                        with co:
+                            q['options'][j] = st.text_input(f"Seçenek {j+1}:", value=opt, key=f"option_{q['id']}_{j}")
+                        with cr:
+                            if st.button("❌", key=f"remove_option_{q['id']}_{j}"):
+                                remove_option(q['id'], j)
                                 st.rerun()
-                
-                if st.button("➕ Seçenek Ekle", key=f"add_option_{question['id']}"):
-                    add_option(question['id'])
+                if st.button("➕ Seçenek Ekle", key=f"add_option_{q['id']}"):
+                    add_option(q['id'])
                     st.rerun()
-    
-    # Add question button below the last question
+
     if st.button("➕ Yeni Soru Ekle", type="primary", use_container_width=True):
         add_question()
-    
-    # Preview and Apply buttons
+
     st.markdown("---")
-    
     if st.session_state.questions:
-        col_preview, col_apply = st.columns(2)
-        
-        with col_preview:
+        cprev, capply = st.columns(2)
+        with cprev:
             if st.button("👁️ Formu Önizle", type="secondary", use_container_width=True):
                 st.session_state.show_preview = not st.session_state.show_preview
-        
-        with col_apply:
+        with capply:
             if st.button("✅ Formu Uygula", type="primary", use_container_width=True):
                 save_form()
-    
-    # Preview section
+
     if st.session_state.show_preview and st.session_state.questions:
         st.markdown("---")
         st.header("Form Önizleme")
-        st.markdown("**Oluşturulan Form:**")
-        
-        for question in st.session_state.questions:
-            with st.container():
-                st.markdown("---")
-                
-                # Show required indicator
-                required_text = " *" if question['is_required'] else ""
-                st.markdown(f"**Soru {question['rank'] + 1}{required_text}**")
-                
-                # Render preview
-                render_question_preview(question)
+        for q in sorted(st.session_state.questions, key=lambda x: x['rank']):
+            st.markdown("---")
+            req = " *" if q['is_required'] else ""
+            st.markdown(f"**Soru {q['rank'] + 1}{req}**")
+            render_question_preview(q)
 
 if __name__ == "__main__":
-    main() 
+    main()
