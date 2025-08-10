@@ -54,7 +54,7 @@ def get_host_events(host_id):
                 'end_date': fields.get('end_date', ''),
                 'capacity': fields.get('capacity', 0),
                 'is_visible': fields.get('is_visible', False),
-                'ID': fields.get('ID', '')
+                'ID': fields.get('id', '')
             })
         
         return events
@@ -72,17 +72,44 @@ def categorize_events(events):
     
     for event in events:
         try:
-            start_date = datetime.fromisoformat(event['start_date'].replace('Z', '+00:00'))
-            end_date = datetime.fromisoformat(event['end_date'].replace('Z', '+00:00'))
+            # Parse start_date and end_date
+            start_date_str = event['start_date']
+            end_date_str = event['end_date']
             
+            # Handle different date formats and timezone issues
+            if isinstance(start_date_str, str):
+                # Remove timezone info if present and parse
+                start_date_str_clean = start_date_str.replace('Z', '').replace('+00:00', '')
+                end_date_str_clean = end_date_str.replace('Z', '').replace('+00:00', '')
+                
+                # Parse dates without timezone info
+                start_date = datetime.fromisoformat(start_date_str_clean)
+                end_date = datetime.fromisoformat(end_date_str_clean)
+            else:
+                # If already datetime objects, use them directly
+                start_date = start_date_str
+                end_date = end_date_str
+            
+            # Ensure all dates are timezone-naive for comparison
+            if start_date.tzinfo is not None:
+                start_date = start_date.replace(tzinfo=None)
+            if end_date.tzinfo is not None:
+                end_date = end_date.replace(tzinfo=None)
+            if current_timestamp.tzinfo is not None:
+                current_timestamp = current_timestamp.replace(tzinfo=None)
+            
+            # Categorize events
             if start_date <= current_timestamp <= end_date:
                 current_events.append(event)
             elif start_date > current_timestamp:
                 upcoming_events.append(event)
             elif end_date < current_timestamp:
                 past_events.append(event)
+                
         except Exception as e:
             st.warning(f"Tarih ayrıştırma hatası: {e}")
+            # Add to upcoming events as fallback
+            upcoming_events.append(event)
     
     # Sort by end_date descending
     current_events.sort(key=lambda x: x['end_date'], reverse=True)
@@ -105,11 +132,23 @@ def render_event_card(event, event_type):
             st.markdown(f"**Kapasite:** {event['capacity']} kişi")
             
             try:
-                start_date = datetime.fromisoformat(event['start_date'].replace('Z', '+00:00'))
-                end_date = datetime.fromisoformat(event['end_date'].replace('Z', '+00:00'))
+                # Handle date display with proper timezone handling
+                start_date_str = event['start_date']
+                end_date_str = event['end_date']
+                
+                if isinstance(start_date_str, str):
+                    start_date_str_clean = start_date_str.replace('Z', '').replace('+00:00', '')
+                    end_date_str_clean = end_date_str.replace('Z', '').replace('+00:00', '')
+                    
+                    start_date = datetime.fromisoformat(start_date_str_clean)
+                    end_date = datetime.fromisoformat(end_date_str_clean)
+                else:
+                    start_date = start_date_str
+                    end_date = end_date_str
+                
                 st.markdown(f"**Başlangıç:** {start_date.strftime('%d/%m/%Y %H:%M')}")
                 st.markdown(f"**Bitiş:** {end_date.strftime('%d/%m/%Y %H:%M')}")
-            except:
+            except Exception as e:
                 st.markdown(f"**Başlangıç:** {event['start_date']}")
                 st.markdown(f"**Bitiş:** {event['end_date']}")
             
