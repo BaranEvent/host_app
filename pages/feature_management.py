@@ -32,18 +32,22 @@ FEATURES = {
     "registration_form": {
         "name": "Kayıt Formu",
         "description": "Etkinliğiniz için özelleştirilebilir kayıt formu oluşturun. Katılımcıların bilgilerini toplayın ve yönetin.",
-        "category": "before_event"
+        "category": "before_event",
+        # Explicit mapping to Airtable's feature_id for clarity
+        "feature_id": 1
     }
     # Future features can be added here:
     # "live_polling": {
     #     "name": "Canlı Anket",
     #     "description": "Etkinlik sırasında katılımcılarla canlı anket yapın.",
-    #     "category": "during_event"
+    #     "category": "during_event",
+    #     "feature_id": 2
     # },
     # "feedback_survey": {
     #     "name": "Geri Bildirim Anketi",
     #     "description": "Etkinlik sonrası katılımcılardan geri bildirim toplayın.",
-    #     "category": "after_event"
+    #     "category": "after_event",
+    #     "feature_id": 3
     # }
 }
 
@@ -56,21 +60,59 @@ def get_airtable_table(table_name):
     api = get_airtable_api()
     return api.table(AIRTABLE_CONFIG["base_id"], table_name)
 
-def load_event_features(event_id):
-    """Load existing features for an event"""
+# --- NEW HELPERS for (event_id, feature_id=1) flow ---
+
+def get_event_feature_record(event_id: Any, feature_id: int):
+    """
+    Fetch a single record from 'event_features' for given event_id and feature_id.
+    Returns dict {'record': {...}, 'is_active': bool} if found, else None.
+    """
     try:
         table = get_airtable_table("event_features")
-        records = table.all(formula=f"{{event_id}} = {event_id}")
-        
+        # Airtable formula: assume event_id stored as text; quote it.
+        # If your event_id field in Airtable is numeric, Airtable will still match string-literal to number.
+        formula = f"AND({{event_id}}='{str(event_id)}', {{feature_id}}={feature_id})"
+        records = table.all(formula=formula, max_records=1)
+        if records:
+            rec = records[0]
+            is_active = bool(rec['fields'].get('is_active', False))
+            return {"record": rec, "is_active": is_active}
+        return None
+    except Exception as e:
+        st.error(f"Özellik durumu alınırken hata oluştu: {str(e)}")
+        return None
+
+def update_event_feature_is_active(record_id: str, is_active: bool) -> bool:
+    """Update 'is_active' on the given record_id in Airtable. Returns True on success."""
+    try:
+        table = get_airtable_table("event_features")
+        table.update(record_id, {"is_active": is_active})
+        return True
+    except Exception as e:
+        st.error(f"Özellik güncellenirken hata oluştu: {str(e)}")
+        return False
+
+def is_feature_active(event_id: Any, feature_id: int) -> bool:
+    """Convenience: check if a feature is active for summary section."""
+    data = get_event_feature_record(event_id, feature_id)
+    return bool(data and data.get("is_active", False))
+
+# --- Existing function kept (used for other parts) ---
+def load_event_features(event_id):
+    """Load existing features for an event (legacy path; uses feature_key/enabled if present)."""
+    try:
+        table = get_airtable_table("event_features")
+        # Kept as-is for minimal change; quoting event_id for safety
+        records = table.all(formula=f"{{event_id}} = '{str(event_id)}'")
         features = {}
         for record in records:
             feature_key = record['fields'].get('feature_key', '')
             if feature_key:
                 features[feature_key] = {
                     'id': record['id'],
+                    # Backward-compatible; many bases used 'enabled'. We don't rely on this for registration_form.
                     'enabled': record['fields'].get('enabled', False)
                 }
-        
         return features
     except Exception as e:
         st.error(f"Özellikler yüklenirken hata oluştu: {str(e)}")
@@ -109,13 +151,48 @@ def render_feature_section(title, features, category, event_id):
             with col2:
                 st.markdown(f"**{feature_info['name']}**")
                 st.markdown(f"*{feature_info['description']}*")
-                
-                # Check if feature is enabled for this event
-                existing_features = load_event_features(event_id)
-                if feature_key in existing_features and existing_features[feature_key]['enabled']:
-                    st.success("✅ Bu özellik etkinliğiniz için aktif")
+
+                # --- SPECIAL HANDLING for 'Kayıt Formu' (feature_id=1) ---
+                if feature_key == "registration_form":
+                    feature_id = feature_info.get("feature_id", 1)
+                    ef = get_event_feature_record(event_id, feature_id)
+
+                    if ef is None:
+                        # No record exists -> keep original messaging ("henüz yapılandırılmamış")
+                        st.info("ℹ️ Bu özellik henüz yapılandırılmamış")
+                    else:
+                        # Show toggle UI using a form to require explicit 'Apply'
+                        current_active = ef["is_active"]
+                        rec_id = ef["record"]["id"]
+
+                        with st.form(key=f"{feature_key}_activation_form"):
+                            new_active = st.checkbox(
+                                "Bu özelliği etkinleştir",
+                                value=current_active,
+                                key=f"{feature_key}_active_checkbox"
+                            )
+                            applied = st.form_submit_button("Uygula")
+                            if applied:
+                                if update_event_feature_is_active(rec_id, new_active):
+                                    # Immediate feedback
+                                    if new_active:
+                                        st.success("✅ Kayıt Formu etkinleştirildi.")
+                                    else:
+                                        st.warning("⏹️ Kayıt Formu devre dışı bırakıldı.")
+                                    # Rerun to reflect the latest state cleanly
+                                    st.rerun()
+                        # Status line under the form
+                        if current_active:
+                            st.success("✅ Bu özellik etkinliğiniz için aktif")
+                        else:
+                            st.info("ℹ️ Bu özellik şu anda devre dışı")
                 else:
-                    st.info("ℹ️ Bu özellik henüz yapılandırılmamış")
+                    # Legacy path for other features (if any are added later)
+                    existing_features = load_event_features(event_id)
+                    if feature_key in existing_features and existing_features[feature_key]['enabled']:
+                        st.success("✅ Bu özellik etkinliğiniz için aktif")
+                    else:
+                        st.info("ℹ️ Bu özellik henüz yapılandırılmamış")
 
 def main():
     st.title("⚙️ Etkinlik Özellikleri Yönetimi")
@@ -155,10 +232,10 @@ def main():
     
     st.info(f"**Etkinlik ID:** {event_id}")
     
-    # Load existing features
+    # Load existing features (legacy usage)
     existing_features = load_event_features(event_id)
     
-    # Update session state with existing features
+    # Update session state with existing features (legacy usage)
     for feature_key, feature_data in existing_features.items():
         st.session_state.selected_features[feature_key] = feature_data['enabled']
     
@@ -180,7 +257,13 @@ def main():
     st.markdown("---")
     st.header("📊 Özet")
     
+    # Legacy summary list, plus explicit check for registration_form is_active
     active_features = [k for k, v in existing_features.items() if v['enabled']]
+    # Ensure registration_form reflects the new is_active field if a record exists
+    reg = FEATURES.get("registration_form")
+    if reg and is_feature_active(event_id, reg.get("feature_id", 1)):
+        if "registration_form" not in active_features:
+            active_features.append("registration_form")
     
     if active_features:
         st.success(f"**{len(active_features)}** özellik aktif:")
@@ -197,4 +280,4 @@ def main():
         st.rerun()
 
 if __name__ == "__main__":
-    main() 
+    main()
